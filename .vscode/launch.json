@@ -8,7 +8,7 @@
             "name": "Launch",
             "type": "coreclr",
             "request": "launch",
-            "program": "bin/Debug/net7.0/SharpBot.exe",
+            "program": "bin/x64/Debug/net7.0/SharpBot.exe",
             "args": [],
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal"

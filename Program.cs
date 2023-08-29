@@ -4,6 +4,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.WebSockets;
 using System.Text;
+using System.Text.Json.Nodes;
 using System.Threading;
 
 internal class Program
@@ -56,16 +57,26 @@ internal class Program
       // We have <10 sec to subscribe to an event, also another connection has to be used because we can't send messages to websocket server
       using (HttpRequestMessage request = new HttpRequestMessage(new HttpMethod("POST"), "https://api.twitch.tv/helix/eventsub/subscriptions"))
       {
+        string penis = 
+        $$"""
+        {
+          "type": "channel.follow",
+          "version": "2",
+          "condition":
+          { 
+            "broadcaster_user_id": "{{Config.ChannelID}}",
+            "moderator_user_id": "{{Config.ChannelID}}"
+          },
+          "transport":
+          {
+            "method":"websocket",
+            "session_id": "{{sessionID}}"
+          }
+        }
+        """;
         request.Headers.Add("Client-Id", Config.BotID);
         request.Headers.Add("Authorization", "Bearer " + Config.BotAccessToken);
-        request.Content = new StringContent("{\"type\":\"channel.follow\"," +
-                                            "\"version\":\"2\"," +
-                                            "\"condition\":{" +
-                                                "\"broadcaster_user_id\":\"" + Config.ChannelID + "\"," +
-                                                "\"moderator_user_id\": \"" + Config.ChannelID + "\"}," +
-                                            "\"transport\":{" +
-                                                "\"method\":\"websocket\"," +
-                                                "\"session_id\":\"" + sessionID + "\"}}");
+        request.Content =  new StringContent(penis);
         request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse("application/json");
         string response = Client.SendAsync(request).Result.Content.ReadAsStringAsync().Result;
       }
