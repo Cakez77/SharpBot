@@ -4,10 +4,9 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.WebSockets;
 using System.Text;
-using System.Text.Json.Nodes;
 using System.Threading;
 
-internal class Program
+internal class SharpBot
 {
   private static HttpClient Client = new HttpClient();
   private static ClientWebSocket WebSocket = new ClientWebSocket();
@@ -19,9 +18,9 @@ internal class Program
 
     WebSocketReceiveResult receiveResult;
     byte[] buffer = new byte[8192];
-    string sessionID = null;
+    string sessionID;
     string message;
-    int temp, temp2;
+    EventMessage messageDeserialized;
 
     GetNewAccessToken();
     GetChannelID();
@@ -29,56 +28,35 @@ internal class Program
     // Create WebSocket connection
     // We need to set client ID and auth before connecting
     WebSocket.Options.SetRequestHeader("Client-Id", Config.BotID);
-    WebSocket.Options.SetRequestHeader("Authorization", "Bearer " + Config.BotAccessToken);
+    WebSocket.Options.SetRequestHeader("Authorization", $"Bearer {Config.BotAccessToken}");
     WebSocket.ConnectAsync(new Uri("wss://eventsub.wss.twitch.tv/ws"), CancellationToken.None).Wait();
     // Check if it worked
     receiveResult = WebSocket.ReceiveAsync(buffer, CancellationToken.None).Result;
     if (receiveResult.Count <= 0)
     {
-      throw new Exception("Something went wrong.");
+      throw new Exception("Couldn't connect to wss://eventsub.wss.twitch.tv/ws.");
     }
     else
     {
       message = Encoding.UTF8.GetString(buffer, 0, receiveResult.Count);
-      Console.WriteLine(message);
-
-      // Parse welcome message, for now assume that everything needed is inside the message, otherwise it would throw an error
-      temp = message.IndexOf("\"payload\":{\"session\":{\"id\":\"");
-      if (temp >= 0)
-      {
-        temp += "\"payload\":{\"session\":{\"id\":\"".Length;
-        temp2 = message.IndexOf("\"", temp);
-        sessionID = message.Substring(temp, temp2 - temp);
-      }
-
-      if (string.IsNullOrWhiteSpace(sessionID)) throw new Exception("Couldn't read session ID");
+      Console.WriteLine("Got welcome message.");
+      // Parse welcome message
+      WelcomeMessage welcomeMessage = WelcomeMessage.Deserialize(message);
+      if (welcomeMessage?.Payload?.Session?.ID is null) throw new Exception("Couldn't read session ID.");
+      else sessionID = welcomeMessage.Payload.Session.ID;
 
       // Subscribe to every event you want to
       // We have <10 sec to subscribe to an event, also another connection has to be used because we can't send messages to websocket server
+      Console.WriteLine("Subscribing to channel follow event.");
       using (HttpRequestMessage request = new HttpRequestMessage(new HttpMethod("POST"), "https://api.twitch.tv/helix/eventsub/subscriptions"))
       {
-        string penis = 
-        $$"""
-        {
-          "type": "channel.follow",
-          "version": "2",
-          "condition":
-          { 
-            "broadcaster_user_id": "{{Config.ChannelID}}",
-            "moderator_user_id": "{{Config.ChannelID}}"
-          },
-          "transport":
-          {
-            "method":"websocket",
-            "session_id": "{{sessionID}}"
-          }
-        }
-        """;
         request.Headers.Add("Client-Id", Config.BotID);
-        request.Headers.Add("Authorization", "Bearer " + Config.BotAccessToken);
-        request.Content =  new StringContent(penis);
+        request.Headers.Add("Authorization", $"Bearer {Config.BotAccessToken}");
+        request.Content = new StringContent(new SubscriptionMessage("channel.follow", Config.ChannelID, sessionID).ToJsonString());
         request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse("application/json");
-        string response = Client.SendAsync(request).Result.Content.ReadAsStringAsync().Result;
+        ResponseMessage response = ResponseMessage.Deserialize(Client.SendAsync(request).Result.Content.ReadAsStringAsync().Result);
+        if (response.Error is not null) Console.WriteLine(string.Concat("Error: ", response.Message));
+        else Console.WriteLine(string.Concat("Response: ", response.Data?[0].Type, " ", response.Data?[0].Status, "."));
       }
     }
 
@@ -87,15 +65,24 @@ internal class Program
       if (WebSocket.State == WebSocketState.Open)
       {
         receiveResult = WebSocket.ReceiveAsync(buffer, CancellationToken.None).Result;
-        if (receiveResult.Count <= 0) { Console.WriteLine("Received 0 bytes or less."); }
+        if (receiveResult.Count <= 0) { Console.WriteLine($"Received {receiveResult.Count} bytes."); }
         else
         {
           message = Encoding.UTF8.GetString(buffer, 0, receiveResult.Count);
-          temp = message.IndexOf("\"message_type\":\"session_keepalive\"");
-          if (temp >= 0)
+          messageDeserialized = EventMessage.Deserialize(message);
+          if (messageDeserialized?.Metadata?.MessageType?.Equals("session_keepalive") == true)
           {
             // Keep alive message, if it wasn't received in "keepalive_timeout_seconds" time from welcome message the connection should be restarted
             Console.WriteLine("Got keepalive message.");
+          }
+          else if (messageDeserialized?.Metadata?.MessageType?.Equals("notification") == true)
+          {
+            // Received notification event
+            if (messageDeserialized?.Metadata?.SubscriptionType?.Equals("channel.follow") == true)
+            {
+              // Received channel follow event
+              Console.WriteLine($"New follow from {messageDeserialized?.Payload?.Event?.UserName}.");
+            }
           }
           else
           {
@@ -107,7 +94,7 @@ internal class Program
       else
       {
         // Do something? Reconnect? For now do nothing.
-        Console.WriteLine("Socket not opened");
+        Console.WriteLine("Socket not opened. Closing the program.");
         break;
       }
 
@@ -120,34 +107,37 @@ internal class Program
     using (HttpRequestMessage request = new HttpRequestMessage(new HttpMethod("GET"), "https://api.twitch.tv/helix/users?login=" + Config.ChannelName))
     {
       request.Headers.Add("Client-Id", Config.BotID);
-      request.Headers.Add("Authorization", "Bearer " + Config.BotAccessToken);
+      request.Headers.Add("Authorization", $"Bearer {Config.BotAccessToken}");
 
-      string response = Client.SendAsync(request).Result.Content.ReadAsStringAsync().Result;
+      ChannelIDResponse response = ChannelIDResponse.Deserialize(Client.SendAsync(request).Result.Content.ReadAsStringAsync().Result);
       // Read information from received data
-      if (response.Contains("\"id\":"))
+      if (response?.Data?[0].ID is null)
       {
-        int index = response.IndexOf("\"id\":") + 6;
-        Config.ChannelID = response.Substring(index, response.IndexOf("\",", index) - index);
+        throw new Exception(string.Concat(">> Couldn't acquire broadcaster ID. Probably defined channel name doesn't exist.", Environment.NewLine, ">> Event bot initialization failed."));
       }
       else
       {
-        throw new Exception(">> Couldn't acquire broadcaster ID. Probably defined channel name doesn't exist." + Environment.NewLine + ">> Event bot initialization failed.");
+        Config.ChannelID = response.Data[0].ID;
       }
     }
   }
 
   static void GetNewAccessToken()
   {
-    string uri = "https://id.twitch.tv/oauth2/authorize?" +
-                  "client_id=" + Config.BotID +
-                  "&redirect_uri=http://localhost:3000" +
-                  "&response_type=code" +
-                  // When asking for permissions the scope of permissions has to be determined 
-                  // if tried to follow to event without getting permissions for it, the follow returns an error
-                  "&scope=" + ("bits:read" // View Bits information for a channel
-                              + "+channel:read:redemptions" // View Channel Points custom rewards and their redemptions on a channel.
-                              + "+moderator:read:followers" // Read followers, needs to be a moderator...
-                              ).Replace(":", "%3A");
+    string uri = string.Concat(
+      "https://id.twitch.tv/oauth2/authorize?",
+      "client_id=", Config.BotID,
+      "&redirect_uri=http://localhost:3000",
+      "&response_type=code",
+      // When asking for permissions the scope of permissions has to be determined 
+      // if tried to follow to event without getting permissions for it, the follow returns an error
+      "&scope=",
+        string.Concat(
+          "bits:read", // View Bits information for a channel
+          "+channel:read:redemptions", // View Channel Points custom rewards and their redemptions on a channel.
+          "+moderator:read:followers" // Read followers, needs to be a moderator...
+        ).Replace(":", "%3A") // Change to url encoded
+      );
 
     // Open the link for the user to complete authorization
     System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo() { FileName = uri, UseShellExecute = true });
@@ -176,30 +166,21 @@ internal class Program
       string code = requestUrl.Substring(6, requestUrl.IndexOf('&', 6) - 6);
       using (HttpRequestMessage request = new HttpRequestMessage(new HttpMethod("POST"), "https://id.twitch.tv/oauth2/token"))
       {
-        request.Content = new StringContent("client_id=" + Config.BotID +
-                                            "&client_secret=" + Config.BotSecret +
-                                            "&code=" + code +
-                                            "&grant_type=authorization_code" +
-                                            "&redirect_uri=http://localhost:3000");
+        request.Content = new StringContent(string.Concat(
+            "client_id=", Config.BotID,
+            "&client_secret=", Config.BotSecret,
+            "&code=", code,
+            "&grant_type=authorization_code",
+            "&redirect_uri=http://localhost:3000")
+          );
         request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse("application/x-www-form-urlencoded");
 
-        string response = Client.SendAsync(request).Result.Content.ReadAsStringAsync().Result;
+        AccessTokenResponse response = AccessTokenResponse.Deserialize(Client.SendAsync(request).Result.Content.ReadAsStringAsync().Result);
+        if (response is null || response.Token is null || response.RefreshToken is null) throw new Exception("");
+        Console.WriteLine(response.ToString());
         // Read information from received data
-        int temp, temp2;
-        temp = response.IndexOf("\"access_token\":\"");
-        if (temp >= 0)
-        {
-          temp += "\"access_token\":\"".Length;
-          temp2 = response.IndexOf("\"", temp);
-          Config.BotAccessToken = response.Substring(temp, temp2 - temp);
-        }
-        temp = response.IndexOf("\"refresh_token\":\"");
-        if (temp >= 0)
-        {
-          temp += "\"refresh_token\":\"".Length;
-          temp2 = response.IndexOf("\"", temp);
-          Config.BotRefreshToken = response.Substring(temp, temp2 - temp);
-        }
+        Config.BotAccessToken = response.Token;
+        Config.BotRefreshToken = response.RefreshToken;
       }
     }
     else
